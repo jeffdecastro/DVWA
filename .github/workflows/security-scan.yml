@@ -1,0 +1,81 @@
+name: Security Scan
+
+# Runs SAST/SCA scanners, uploads their raw output as artifacts, then calls the
+# shared reusable workflow to normalize everything and post one risk-ranked,
+# CWE-aware PR comment. Reporting only - never gates a merge.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-analysis:
+    name: Static analysis (Semgrep + Trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Run Semgrep
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          pip install --quiet semgrep
+          # --error would fail the build; this pipeline is reporting-only.
+          semgrep scan --config=p/default --sarif --output=semgrep.sarif \
+            --metrics=off --no-error . || true
+          ls -l semgrep.sarif
+
+      - name: Upload Semgrep output
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: semgrep-output
+          path: semgrep.sarif
+          if-no-files-found: warn
+
+      - name: Run Trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy.sarif
+          exit-code: '0'
+
+      - name: Upload Trivy output
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: trivy-output
+          path: trivy.sarif
+          if-no-files-found: warn
+
+  gemini-report:
+    name: Gemini Report (dev-readable, risk-prioritized)
+    if: always() && github.event_name == 'pull_request'
+    needs: [static-analysis]
+    uses: jeffdecastro/security-pipeline-shared/.github/workflows/gemini-report.yml@harden/qa-appsec-review
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+      artifact_manifest: "semgrep-sarif=semgrep-output,trivy-sarif=trivy-output"
+      shared_ref: harden/qa-appsec-review
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
