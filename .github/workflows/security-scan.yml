@@ -173,13 +173,13 @@ jobs:
     name: Gemini Report (dev-readable, risk-prioritized)
     if: always() && github.event_name == 'pull_request'
     needs: [static-analysis, dynamic-scan]
-    uses: jeffdecastro/security-pipeline-shared/.github/workflows/gemini-report.yml@harden/qa-appsec-review
+    uses: jeffdecastro/security-pipeline-shared/.github/workflows/gemini-report.yml@main
     permissions:
       contents: read
       pull-requests: write
     with:
       pr_number: ${{ github.event.pull_request.number }}
       artifact_manifest: "semgrep-sarif=semgrep-output,trivy-sarif=trivy-output,zap-json=zap-output"
-      shared_ref: harden/qa-appsec-review
+      shared_ref: main
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
