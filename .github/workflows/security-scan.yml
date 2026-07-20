@@ -1,0 +1,185 @@
+name: Security Scan
+
+# Runs SAST/SCA/DAST scanners, uploads their raw output as artifacts, then calls
+# the shared reusable workflow to normalize everything and post one risk-ranked,
+# CWE-aware PR comment. Reporting only - never gates a merge.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-analysis:
+    name: Static analysis (Semgrep + Trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Run Semgrep
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          pip install --quiet semgrep
+          # --error would fail the build; this pipeline is reporting-only.
+          semgrep scan --config=p/default --sarif --output=semgrep.sarif \
+            --metrics=off --no-error . || true
+          ls -l semgrep.sarif
+
+      - name: Upload Semgrep output
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: semgrep-output
+          path: semgrep.sarif
+          if-no-files-found: warn
+
+      - name: Run Trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy.sarif
+          exit-code: '0'
+
+      - name: Upload Trivy output
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: trivy-output
+          path: trivy.sarif
+          if-no-files-found: warn
+
+  dynamic-scan:
+    name: Dynamic analysis (OWASP ZAP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Build and start DVWA
+        run: |
+          set -euo pipefail
+          # compose.ci.yml overrides the published image with a local build, so
+          # DAST exercises the code in this PR rather than upstream's release.
+          docker compose -f compose.yml -f compose.ci.yml up -d --build
+          docker compose -f compose.yml -f compose.ci.yml ps
+
+      - name: Wait for DVWA to answer
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4280/login.php || true)
+            if [ "$code" = "200" ] || [ "$code" = "302" ]; then
+              echo "DVWA responding with HTTP $code after ${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::DVWA did not become reachable"
+          docker compose -f compose.yml -f compose.ci.yml logs --tail=50
+          exit 1
+
+      - name: Initialize DVWA database
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # setup.php needs a CSRF token from the form plus a session cookie.
+          # Without this the app only serves the login page and the scan surface
+          # is tiny. Best-effort: a failure here still leaves a scannable app.
+          curl -s -c cookies.txt http://127.0.0.1:4280/setup.php -o setup.html
+          # Parsed in Python rather than with a regex, so the attribute order in
+          # the hidden input doesn't matter. Written to a file first: a heredoc
+          # nested inside $(...) does not parse reliably.
+          cat > parse_token.py <<'PY'
+          import re
+          html = open("setup.html", encoding="utf-8", errors="replace").read()
+          for tag in re.findall(r"<input[^>]*>", html, re.I):
+              if re.search(r"""name=['"]user_token['"]""", tag, re.I):
+                  m = re.search(r"""value=['"]([^'"]+)['"]""", tag, re.I)
+                  if m:
+                      print(m.group(1))
+                      break
+          PY
+          token=$(python3 parse_token.py)
+          echo "csrf token acquired: ${token:+yes}"
+          curl -s -b cookies.txt -c cookies.txt -X POST \
+            --data-urlencode "create_db=Create / Reset Database" \
+            --data-urlencode "user_token=${token}" \
+            http://127.0.0.1:4280/setup.php -o /dev/null -w 'setup.php -> %{http_code}\n'
+
+      - name: Run ZAP baseline scan
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p zap-out && chmod 777 zap-out
+          # -I: report issues but exit 0. This pipeline never gates a merge, and
+          # ZAP exits non-zero on any WARN by default.
+          docker run --rm --network host \
+            -v "$PWD/zap-out:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://127.0.0.1:4280 \
+              -J zap.json \
+              -r zap.html \
+              -I \
+              -m 3 || true
+          ls -l zap-out/
+          python3 - <<'PY'
+          import json
+          d = json.load(open("zap-out/zap.json"))
+          sites = d.get("site", [])
+          n = sum(len(s.get("alerts", [])) for s in sites)
+          print(f"ZAP produced {n} alert(s) across {len(sites)} site(s)")
+          # Surface alerts with an empty instances[] explicitly: that shape used
+          # to crash the shared pipeline's ZAP parser with an IndexError.
+          empty = [a.get("name") for s in sites for a in s.get("alerts", [])
+                   if not a.get("instances")]
+          print(f"alerts with empty instances[]: {len(empty)} {empty[:5]}")
+          PY
+
+      - name: Upload ZAP output
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: zap-output
+          path: zap-out/
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f compose.yml -f compose.ci.yml down -v || true
+
+  gemini-report:
+    name: Gemini Report (dev-readable, risk-prioritized)
+    if: always() && github.event_name == 'pull_request'
+    needs: [static-analysis, dynamic-scan]
+    uses: jeffdecastro/security-pipeline-shared/.github/workflows/gemini-report.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+      artifact_manifest: "semgrep-sarif=semgrep-output,trivy-sarif=trivy-output,zap-json=zap-output"
+      shared_ref: main
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
