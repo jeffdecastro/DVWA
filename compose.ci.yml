@@ -1,0 +1,11 @@
+# CI override for compose.yml.
+#
+# The committed compose.yml pulls the published ghcr.io/digininja/dvwa image.
+# For a DAST scan in CI that would test upstream's release rather than the code
+# in the pull request, so this override forces a local build of the checked-out
+# source instead.
+services:
+  dvwa:
+    build: .
+    image: dvwa-ci:latest
+    pull_policy: build
